@@ -14,10 +14,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: laravel-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
     name: Build and test
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
 
     services:
       mysql:
@@ -39,6 +44,7 @@ jobs:
     env:
       APP_ENV: testing
       APP_DEBUG: false
+      LOG_CHANNEL: stderr
 
       DB_CONNECTION: mysql
       DB_HOST: 127.0.0.1
@@ -46,6 +52,11 @@ jobs:
       DB_DATABASE: laravel_test
       DB_USERNAME: root
       DB_PASSWORD: root
+
+      CACHE_DRIVER: array
+      SESSION_DRIVER: array
+      QUEUE_CONNECTION: sync
+      MAIL_MAILER: array
 
     steps:
       - name: Checkout
@@ -73,28 +84,39 @@ jobs:
         with:
           node-version: "18"
           cache: npm
+          cache-dependency-path: package-lock.json
 
       - name: Prepare Laravel environment
-        run: |
-          cp .env.example .env
+        run: cp .env.example .env
 
       - name: Validate Composer files
-        run: composer validate
+        run: composer validate --strict
 
       - name: Install PHP dependencies
         run: |
           composer install \
             --no-interaction \
             --prefer-dist \
-            --no-progress
+            --no-progress \
+            --optimize-autoloader
 
       - name: Generate application key
         run: php artisan key:generate
 
-      - name: Clear Laravel configuration
+      - name: Clear Laravel caches
         run: |
           php artisan config:clear
+          php artisan route:clear
+          php artisan view:clear
           php artisan cache:clear
+
+      - name: Display application information
+        run: |
+          php --version
+          composer --version
+          node --version
+          npm --version
+          php artisan --version
 
       - name: Run database migrations
         run: php artisan migrate --force
