@@ -1,0 +1,109 @@
+name: Laravel CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+  pull_request:
+    branches:
+      - main
+      - develop
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-22.04
+
+    services:
+      mysql:
+        image: mysql:8.0
+
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: laravel_test
+
+        ports:
+          - 3306:3306
+
+        options: >-
+          --health-cmd="mysqladmin ping --host=127.0.0.1 --user=root --password=root"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      APP_ENV: testing
+      APP_DEBUG: false
+
+      DB_CONNECTION: mysql
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3306
+      DB_DATABASE: laravel_test
+      DB_USERNAME: root
+      DB_PASSWORD: root
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "7.4"
+          extensions: >
+            bcmath,
+            ctype,
+            fileinfo,
+            json,
+            mbstring,
+            openssl,
+            pdo_mysql,
+            tokenizer,
+            xml
+          coverage: none
+          tools: composer:v2
+
+      - name: Configure Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: npm
+
+      - name: Prepare Laravel environment
+        run: |
+          cp .env.example .env
+
+      - name: Validate Composer files
+        run: composer validate
+
+      - name: Install PHP dependencies
+        run: |
+          composer install \
+            --no-interaction \
+            --prefer-dist \
+            --no-progress
+
+      - name: Generate application key
+        run: php artisan key:generate
+
+      - name: Clear Laravel configuration
+        run: |
+          php artisan config:clear
+          php artisan cache:clear
+
+      - name: Run database migrations
+        run: php artisan migrate --force
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend assets
+        run: npm run production
+
+      - name: Run automated tests
+        run: php artisan test
