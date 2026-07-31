@@ -89,6 +89,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: laravel-ci-build-${{ github.sha }}
+          include-hidden-files: true
           # node_modules e .env excluídos — binários PHP estão em vendor/
           path: |
             .
@@ -284,7 +285,17 @@ jobs:
         with:
           name: laravel-ci-build-${{ github.sha }}
 
+      - name: Prepare Laravel cache/view paths
+        run: |
+          set -euo pipefail
+          mkdir -p storage/framework/views
+          mkdir -p storage/framework/cache
+          mkdir -p storage/framework/sessions
+          mkdir -p bootstrap/cache
+
       - name: Run PHPStan
+        env:
+          VIEW_COMPILED_PATH: storage/framework/views
         run: |
           php vendor/bin/phpstan analyse \
             --configuration=phpstan.neon \
