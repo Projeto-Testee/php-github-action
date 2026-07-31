@@ -132,8 +132,10 @@ jobs:
         with:
           name: laravel-ci-build-${{ github.sha }}
 
-      - name: Create reports directory
-        run: mkdir -p reports
+      - name: Create required directories
+        run: |
+          mkdir -p reports
+          mkdir -p tests/Unit
 
       - name: Run unit tests
         env:
