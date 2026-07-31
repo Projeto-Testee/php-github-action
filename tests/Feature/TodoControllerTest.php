@@ -1,16 +1,18 @@
 <?php
-declare (strict_types=1);
+declare(strict_types=1);
 
-namespace Tests\Unit;
-
+namespace Tests\Feature;
 
 use App\Models\Todo;
 use App\Models\User;
 use Tests\TestCase;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Event;
 
 class TodoControllerTest extends TestCase
 {
+    use RefreshDatabase;
+
     public function testIndex()
     {
         Event::fake();

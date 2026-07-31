@@ -11,6 +11,8 @@ on:
       - main
       - develop
 
+  workflow_dispatch:
+
 permissions:
   contents: read
 
@@ -19,50 +21,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    name: Build and test
-    runs-on: ubuntu latest
-    timeout-minutes: 20
 
-    services:
-      mysql:
-        image: mysql:8.0
-
-        env:
-          MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD }}
-          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
-
-        ports:
-          - 3306:3306
-
-        options: >-
-          --health-cmd="mysqladmin ping --host=127.0.0.1 --user=root --password=root"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=10
-
-    env:
-      APP_ENV: testing
-      APP_DEBUG: false
-      LOG_CHANNEL: stderr
-
-      DB_CONNECTION: mysql
-      DB_HOST: 127.0.0.1
-      DB_PORT: 3306
-      DB_DATABASE: laravel_test
-      DB_USERNAME: ${{ secrets.DB_USERNAME }}
-      DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-
-      CACHE_DRIVER: array
-      SESSION_DRIVER: array
-      QUEUE_CONNECTION: sync
-      MAIL_MAILER: array
+  # ──────────────────────────────────────────────────────────────────────────
+  # build: compila uma única vez e publica artefato imutável
+  # ──────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure PHP
+      - name: Configure PHP 7.4
         uses: shivammathur/setup-php@v2
         with:
           php-version: "7.4"
@@ -79,15 +51,15 @@ jobs:
           coverage: none
           tools: composer:v2
 
-      - name: Configure Node.js
+      - name: Configure Node.js 18
         uses: actions/setup-node@v4
         with:
           node-version: "18"
           cache: npm
           cache-dependency-path: package-lock.json
 
-      - name: Prepare Laravel environment
-        run: cp .env.example .env
+      - name: Validate required files
+        run: bash .github/scripts/validate-build.sh
 
       - name: Validate Composer files
         run: composer validate --strict
@@ -100,32 +72,266 @@ jobs:
             --no-progress \
             --optimize-autoloader
 
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Compile frontend assets
+        run: npm run production
+
+      - name: Verify build outputs
+        run: |
+          set -euo pipefail
+          test -d vendor                    || { echo "::error::vendor/ not found"; exit 1; }
+          test -f public/js/app.js          || { echo "::error::public/js/app.js not found"; exit 1; }
+          test -f public/mix-manifest.json  || { echo "::error::public/mix-manifest.json not found"; exit 1; }
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: laravel-ci-build-${{ github.sha }}
+          # node_modules e .env excluídos — binários PHP estão em vendor/
+          path: |
+            .
+            !.git
+            !.env
+            !node_modules
+            !storage/logs
+            !reports
+          retention-days: 3
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # unit-tests: testes isolados, sem banco de dados
+  # ──────────────────────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build
+
+    steps:
+      - name: Configure PHP 7.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "7.4"
+          extensions: >
+            bcmath,
+            ctype,
+            fileinfo,
+            json,
+            mbstring,
+            openssl,
+            pdo_mysql,
+            tokenizer,
+            xml
+          coverage: none
+          tools: composer:v2
+
+      - name: Download CI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: laravel-ci-build-${{ github.sha }}
+
+      - name: Create reports directory
+        run: mkdir -p reports
+
+      - name: Run unit tests
+        env:
+          APP_ENV: testing
+          APP_KEY: base64:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=
+          CACHE_DRIVER: array
+          SESSION_DRIVER: array
+          QUEUE_CONNECTION: sync
+          MAIL_MAILER: array
+        run: |
+          vendor/bin/phpunit \
+            --testsuite=Unit \
+            --log-junit=reports/unit-junit.xml
+
+      - name: Upload unit test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report-${{ github.sha }}
+          path: reports/unit-junit.xml
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # integration-tests: testes de feature com banco MySQL isolado
+  # ──────────────────────────────────────────────────────────────────────────
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: laravel_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --host=127.0.0.1 --user=root --password=root"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - name: Configure PHP 7.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "7.4"
+          extensions: >
+            bcmath,
+            ctype,
+            fileinfo,
+            json,
+            mbstring,
+            openssl,
+            pdo_mysql,
+            tokenizer,
+            xml
+          coverage: none
+          tools: composer:v2
+
+      - name: Download CI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: laravel-ci-build-${{ github.sha }}
+
+      - name: Prepare Laravel environment
+        run: cp .env.example .env
+
       - name: Generate application key
         run: php artisan key:generate
 
       - name: Clear Laravel caches
         run: |
           php artisan config:clear
-          php artisan route:clear
-          php artisan view:clear
           php artisan cache:clear
 
-      - name: Display application information
-        run: |
-          php --version
-          composer --version
-          node --version
-          npm --version
-          php artisan --version
-
       - name: Run database migrations
+        env:
+          DB_CONNECTION: mysql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 3306
+          DB_DATABASE: laravel_test
+          DB_USERNAME: root
+          DB_PASSWORD: root
         run: php artisan migrate --force
 
-      - name: Install frontend dependencies
-        run: npm ci
+      - name: Create reports directory
+        run: mkdir -p reports
 
-      - name: Build frontend assets
-        run: npm run production
+      - name: Run integration tests
+        env:
+          APP_ENV: testing
+          APP_DEBUG: false
+          LOG_CHANNEL: stderr
+          DB_CONNECTION: mysql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 3306
+          DB_DATABASE: laravel_test
+          DB_USERNAME: root
+          DB_PASSWORD: root
+          CACHE_DRIVER: array
+          SESSION_DRIVER: array
+          QUEUE_CONNECTION: sync
+          MAIL_MAILER: array
+        run: |
+          vendor/bin/phpunit \
+            --testsuite=Feature \
+            --log-junit=reports/integration-junit.xml
 
-      - name: Run automated tests
-        run: php artisan test
+      - name: Upload integration test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-report-${{ github.sha }}
+          path: reports/integration-junit.xml
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # static-analysis: PHPStan level 1 com Larastan
+  # ──────────────────────────────────────────────────────────────────────────
+  static-analysis:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build
+
+    steps:
+      - name: Configure PHP 7.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "7.4"
+          extensions: >
+            bcmath,
+            ctype,
+            fileinfo,
+            json,
+            mbstring,
+            openssl,
+            tokenizer,
+            xml
+          coverage: none
+          tools: composer:v2
+
+      - name: Download CI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: laravel-ci-build-${{ github.sha }}
+
+      - name: Run PHPStan
+        run: |
+          vendor/bin/phpstan analyse \
+            --configuration=phpstan.neon \
+            --error-format=github \
+            --no-progress \
+            --memory-limit=1G
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # package: cria o pacote de entrega somente após todos os gates aprovados
+  #          Executa apenas em push para main (não em pull requests)
+  # ──────────────────────────────────────────────────────────────────────────
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [unit-tests, integration-tests, static-analysis]
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Download CI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: laravel-ci-build-${{ github.sha }}
+          path: build/
+
+      - name: Remove dev-only files from release
+        run: |
+          set -euo pipefail
+          rm -rf \
+            build/tests \
+            build/reports \
+            build/.github \
+            build/node_modules \
+            build/storage/logs \
+            build/phpstan.neon \
+            build/.env.example \
+            build/webpack.mix.js \
+            build/package.json \
+            build/package-lock.json \
+            build/server.php
+
+      - name: Create release tarball
+        run: tar -czf laravel-release-${{ github.sha }}.tar.gz -C build .
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: laravel-release-${{ github.sha }}
+          path: laravel-release-${{ github.sha }}.tar.gz
+          retention-days: 30

@@ -1,0 +1,241 @@
+name: Laravel CD
+
+on:
+  workflow_run:
+    workflows: ["Laravel CI"]
+    types:
+      - completed
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit SHA do pacote a implantar (deixe vazio para usar o HEAD da main)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# Impede dois deploys simultâneos no mesmo ambiente
+concurrency:
+  group: laravel-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # guard: bloqueia execução se a CI não passou ou se o código não vem da main
+  # ──────────────────────────────────────────────────────────────────────────
+  guard:
+    name: Guard — CI must pass on main
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main'
+      )
+
+    steps:
+      - name: Confirm CI passed
+        run: echo "CI approved. Proceeding to deploy."
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # deploy-homologation: implanta em homologação via self-hosted runner
+  # Secrets necessários no environment 'homologation':
+  #   DEPLOY_HOST, DEPLOY_USER, DEPLOY_KEY, DEPLOY_PATH, APP_URL
+  # ──────────────────────────────────────────────────────────────────────────
+  deploy-homologation:
+    name: Deploy — Homologation
+    runs-on: [self-hosted, linux, homologation]
+    timeout-minutes: 15
+    needs: guard
+    environment:
+      name: homologation
+      url: ${{ vars.APP_URL }}
+
+    steps:
+      - name: Resolve target SHA
+        id: sha
+        run: |
+          if [ -n "${{ inputs.sha }}" ]; then
+            echo "sha=${{ inputs.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ github.event.workflow_run.head_sha || github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: laravel-release-${{ steps.sha.outputs.sha }}
+          path: /tmp/deploy/
+
+      - name: Create release directory
+        run: |
+          set -euo pipefail
+          RELEASE_DIR="${{ vars.DEPLOY_PATH }}/releases/${{ steps.sha.outputs.sha }}"
+          mkdir -p "$RELEASE_DIR"
+          tar -xzf /tmp/deploy/laravel-release-${{ steps.sha.outputs.sha }}.tar.gz -C "$RELEASE_DIR"
+
+      - name: Link shared files
+        run: |
+          set -euo pipefail
+          RELEASE_DIR="${{ vars.DEPLOY_PATH }}/releases/${{ steps.sha.outputs.sha }}"
+          # Substitui .env e storage pelo conteúdo compartilhado entre releases
+          rm -rf "$RELEASE_DIR/.env" "$RELEASE_DIR/storage"
+          ln -sfn "${{ vars.DEPLOY_PATH }}/shared/.env"     "$RELEASE_DIR/.env"
+          ln -sfn "${{ vars.DEPLOY_PATH }}/shared/storage"  "$RELEASE_DIR/storage"
+
+      - name: Run migrations
+        run: |
+          set -euo pipefail
+          RELEASE_DIR="${{ vars.DEPLOY_PATH }}/releases/${{ steps.sha.outputs.sha }}"
+          php "$RELEASE_DIR/artisan" migrate --force
+
+      - name: Activate release via symlink
+        run: |
+          set -euo pipefail
+          ln -sfn \
+            "${{ vars.DEPLOY_PATH }}/releases/${{ steps.sha.outputs.sha }}" \
+            "${{ vars.DEPLOY_PATH }}/current"
+
+      - name: Reload PHP-FPM
+        run: sudo systemctl reload php7.4-fpm
+
+      - name: Clean up old releases (keep last 3)
+        run: |
+          set -euo pipefail
+          ls -1dt "${{ vars.DEPLOY_PATH }}/releases/"* \
+            | tail -n +4 \
+            | xargs -r rm -rf
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # smoke-test-homologation: valida que a aplicação responde após o deploy
+  # ──────────────────────────────────────────────────────────────────────────
+  smoke-test-homologation:
+    name: Smoke Test — Homologation
+    runs-on: [self-hosted, linux, homologation]
+    timeout-minutes: 5
+    needs: deploy-homologation
+    environment:
+      name: homologation
+
+    steps:
+      - name: Run smoke test
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: bash ${{ vars.DEPLOY_PATH }}/current/.github/scripts/smoke-test.sh
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # deploy-production: requer aprovação manual no environment 'production'
+  # Configure em Settings > Environments > production:
+  #   - Required reviewers
+  #   - Prevent self-review
+  #   - Branch restriction: main
+  # Secrets necessários: DEPLOY_PATH, APP_URL (via vars)
+  # ──────────────────────────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy — Production
+    runs-on: [self-hosted, linux, production]
+    timeout-minutes: 15
+    needs: smoke-test-homologation
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+
+    steps:
+      - name: Resolve target SHA
+        id: sha
+        run: |
+          if [ -n "${{ inputs.sha }}" ]; then
+            echo "sha=${{ inputs.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ github.event.workflow_run.head_sha || github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: laravel-release-${{ steps.sha.outputs.sha }}
+          path: /tmp/deploy/
+
+      - name: Create release directory
+        run: |
+          set -euo pipefail
+          RELEASE_DIR="${{ vars.DEPLOY_PATH }}/releases/${{ steps.sha.outputs.sha }}"
+          mkdir -p "$RELEASE_DIR"
+          tar -xzf /tmp/deploy/laravel-release-${{ steps.sha.outputs.sha }}.tar.gz -C "$RELEASE_DIR"
+
+      - name: Link shared files
+        run: |
+          set -euo pipefail
+          RELEASE_DIR="${{ vars.DEPLOY_PATH }}/releases/${{ steps.sha.outputs.sha }}"
+          rm -rf "$RELEASE_DIR/.env" "$RELEASE_DIR/storage"
+          ln -sfn "${{ vars.DEPLOY_PATH }}/shared/.env"     "$RELEASE_DIR/.env"
+          ln -sfn "${{ vars.DEPLOY_PATH }}/shared/storage"  "$RELEASE_DIR/storage"
+
+      - name: Save previous release for rollback
+        id: previous
+        run: |
+          set -euo pipefail
+          PREVIOUS=$(readlink -f "${{ vars.DEPLOY_PATH }}/current" 2>/dev/null || echo "")
+          echo "path=${PREVIOUS}" >> "$GITHUB_OUTPUT"
+
+      - name: Run migrations
+        run: |
+          set -euo pipefail
+          RELEASE_DIR="${{ vars.DEPLOY_PATH }}/releases/${{ steps.sha.outputs.sha }}"
+          php "$RELEASE_DIR/artisan" migrate --force
+
+      - name: Activate release via symlink
+        run: |
+          set -euo pipefail
+          ln -sfn \
+            "${{ vars.DEPLOY_PATH }}/releases/${{ steps.sha.outputs.sha }}" \
+            "${{ vars.DEPLOY_PATH }}/current"
+
+      - name: Reload PHP-FPM
+        run: sudo systemctl reload php7.4-fpm
+
+      - name: Clean up old releases (keep last 3)
+        run: |
+          set -euo pipefail
+          ls -1dt "${{ vars.DEPLOY_PATH }}/releases/"* \
+            | tail -n +4 \
+            | xargs -r rm -rf
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # smoke-test-production: valida e faz rollback automático se falhar
+  # ──────────────────────────────────────────────────────────────────────────
+  smoke-test-production:
+    name: Smoke Test — Production
+    runs-on: [self-hosted, linux, production]
+    timeout-minutes: 5
+    needs: deploy-production
+    environment:
+      name: production
+
+    steps:
+      - name: Run smoke test
+        id: smoke
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: bash ${{ vars.DEPLOY_PATH }}/current/.github/scripts/smoke-test.sh
+
+      - name: Rollback on failure
+        if: failure() && steps.smoke.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          PREVIOUS=$(ls -1dt "${{ vars.DEPLOY_PATH }}/releases/"* | sed -n '2p')
+          if [ -n "$PREVIOUS" ]; then
+            echo "::warning::Smoke test failed. Rolling back to ${PREVIOUS}"
+            ln -sfn "$PREVIOUS" "${{ vars.DEPLOY_PATH }}/current"
+            sudo systemctl reload php7.4-fpm
+            echo "::error::Rollback completed. Review the failed release before redeploying."
+          else
+            echo "::error::Smoke test failed and no previous release found for rollback."
+          fi
+          exit 1
